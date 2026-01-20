@@ -1,8 +1,5 @@
 streamlit
-undetected-chromedriver
-setuptools
-selenium
-beautifulsoup4
+requests
 pandas
 numpy
-requests
+plotly
