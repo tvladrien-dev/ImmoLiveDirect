@@ -1,7 +1,7 @@
 streamlit
 undetected-chromedriver
+setuptools
 selenium
-webdriver-manager
 beautifulsoup4
 pandas
 numpy
