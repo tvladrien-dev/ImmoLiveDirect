@@ -1,7 +1,8 @@
-streamlit>=1.30.0
-requests
-pandas
-numpy
+streamlit
+undetected-chromedriver
 selenium
 webdriver-manager
 beautifulsoup4
+pandas
+numpy
+requests
