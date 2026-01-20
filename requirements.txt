@@ -2,4 +2,6 @@ streamlit>=1.30.0
 requests
 pandas
 numpy
-apify-client
+selenium
+webdriver-manager
+beautifulsoup4
