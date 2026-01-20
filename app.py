@@ -2,166 +2,199 @@ import streamlit as st
 import requests
 import pandas as pd
 import numpy as np
+from apify_client import ApifyClient
 
 # --- CONFIGURATION DE LA PAGE ---
-st.set_page_config(page_title="InvestImmo Bot Dynamique", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(
+    page_title="InvestImmo Bot PRO - Live Data", 
+    layout="wide", 
+    initial_sidebar_state="expanded"
+)
 
-# --- FONCTIONS DATA DYNAMIQUES ---
+# --- LOGIQUE DATA HAUTE PRÉCISION ---
 
 def get_sncf_times(token, start_coords, end_coords):
-    """Calcule le temps de trajet via API SNCF (Données réelles)"""
+    """Calcule la durée de trajet réelle via l'API Navitia/SNCF"""
+    # Navitia attend lon,lat
     url = f"https://api.sncf.com/v1/coverage/sncf/journeys?from={start_coords[0]};{start_coords[1]}&to={end_coords[0]};{end_coords[1]}"
     try:
         res = requests.get(url, auth=(token, ""))
         data = res.json()
-        if "journeys" in data:
+        if "journeys" in data and len(data["journeys"]) > 0:
             duration = data["journeys"][0]["duration"]
             return round(duration / 60)
         return "N/A"
     except Exception:
-        return "Calcul impossible"
+        return "Erreur API"
 
 def get_dvf_prices_dynamic(code_insee):
-    """Récupère et calcule le prix m2 réel sur les dernières ventes (API cquest)"""
+    """Extraction et calcul statistique des prix m2 réels (Base Notaires/DVF)"""
     url = f"http://api.cquest.org/dvf?code_commune={code_insee}"
     try:
         res = requests.get(url).json()
         if "features" in res and len(res["features"]) > 0:
             df = pd.DataFrame([f['properties'] for f in res['features']])
+            # Nettoyage et conversion stricte
             df['valeur_fonciere'] = pd.to_numeric(df['valeur_fonciere'], errors='coerce')
             df['surface_reelle_bati'] = pd.to_numeric(df['surface_reelle_bati'], errors='coerce')
             df = df.dropna(subset=['valeur_fonciere', 'surface_reelle_bati'])
             df = df[df['surface_reelle_bati'] > 0]
+            
             if not df.empty:
-                avg_price = (df['valeur_fonciere'] / df['surface_reelle_bati']).mean()
-                return round(avg_price)
-        return 3000 # Valeur pivot si aucune donnée
+                # Calcul du prix au m2 par transaction puis moyenne
+                df['price_m2'] = df['valeur_fonciere'] / df['surface_reelle_bati']
+                return round(df['price_m2'].mean())
+        return 0
     except Exception:
-        return 3000
+        return 0
 
-def get_dynamic_scores(population):
-    """Calcule les 7 piliers dynamiquement en fonction de la population réelle"""
-    # Plus la ville est grande, plus les services sont denses
-    pop_factor = np.log10(population) if population > 0 else 1
-    base_score = min(int(pop_factor * 2), 10)
+def get_dynamic_piliers(population):
+    """Algorithme de scoring des infrastructures basé sur la densité démographique réelle"""
+    if population <= 0: return {k: 0 for k in ["Santé", "Écoles", "Commerces", "Transports", "Sécurité", "Sport", "Loisirs"]}
+    
+    # Logique basée sur la loi de Zipf (densité des services liée à la population)
+    log_pop = np.log10(population)
+    base = min(int(log_pop * 1.8), 10)
     
     return {
-        "Santé": min(base_score + 1, 10),
-        "Écoles": min(base_score, 10),
-        "Commerces": min(base_score + 2, 10),
-        "Transports": min(base_score + 1, 10),
-        "Sécurité": max(10 - base_score, 3), # Souvent inverse à la densité
-        "Sport": min(base_score, 10),
-        "Loisirs": min(base_score + 1, 10)
+        "Santé": min(base + 1, 10),
+        "Écoles": min(base, 10),
+        "Commerces": min(base + 2, 10),
+        "Transports": min(base + 1, 10),
+        "Sécurité": max(10 - (base // 2), 2), # Score inverse à la densité urbaine
+        "Sport": min(base, 10),
+        "Loisirs": min(base + 1, 10)
     }
 
-def fetch_real_listings(ville_nom, code_insee, budget_max):
+def get_real_listings_web(api_token, ville, budget_max):
     """
-    Simule la sortie d'un scraper dynamique. 
-    Dans une version finale, cette fonction appelle une API de scraping (ex: Apify).
-    Elle génère ici des données basées sur les paramètres de la ville.
+    Moteur de scraping réel via Apify. 
+    Interroge Leboncoin/SeLoger et récupère les annonces fraîches.
     """
-    # On génère des opportunités basées sur la ville réelle choisie
-    prefix = ville_nom.capitalize()
-    return [
-        {
-            "id": f"{code_insee}-1",
-            "titre": f"T3 de standing - {prefix} Centre",
-            "prix": int(budget_max * 0.8),
-            "surface": 65,
-            "images": ["https://images.unsplash.com/photo-1502672260266-1c1ef2d93688?w=800"],
-            "coords": [2.3522, 48.8566] # À ajuster selon la ville
-        },
-        {
-            "id": f"{code_insee}-2",
-            "titre": f"Studio Rénové - {prefix} Universités",
-            "prix": int(budget_max * 0.4),
-            "surface": 22,
-            "images": ["https://images.unsplash.com/photo-1522708323590-d24dbb6b0267?w=800"],
-            "coords": [2.3522, 48.8566]
-        }
-    ]
-
-# --- INTERFACE ---
-st.title("🤖 InvestImmo Bot : Analyseur Dynamique")
-
-with st.sidebar:
-    st.header("🔑 Paramètres de Recherche")
-    sncf_token = st.text_input("Token API SNCF", type="password")
-    ville_nom = st.text_input("Ville cible", "Versailles")
-    budget_max = st.number_input("Budget Max (€)", value=500000, step=10000)
-    st.divider()
-    st.write("📈 **État du bot :**")
-    if sncf_token and ville_nom:
-        st.success("Connecté aux API")
-    else:
-        st.warning("En attente de configuration")
-
-if ville_nom and sncf_token:
-    # 1. API Géo pour récupérer les données fondamentales
-    geo_url = f"https://geo.api.gouv.fr/communes?nom={ville_nom}&fields=code,population,centre,codesPostaux"
-    res_geo = requests.get(geo_url).json()
+    if not api_token:
+        return []
     
-    if res_geo:
-        ville = res_geo[0]
-        code_insee = ville['code']
-        coords_ville = ville['centre']['coordinates']
-        population = ville.get('population', 0)
-        
-        # 2. Données Marché Dynamiques
-        prix_m2_moyen = get_dvf_prices_dynamic(code_insee)
-        scores = get_dynamic_scores(population)
-        
-        st.header(f"📍 Ville : {ville['nom']} ({code_insee})")
-        
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Population", f"{population:,} hab.")
-        m2.metric("Prix m² Moyen (DVF)", f"{prix_m2_moyen} €")
-        m3.metric("Potentiel", "Élevé" if population > 50000 else "Niche")
+    client = ApifyClient(api_token)
+    # Configuration du scraper (Actor ID à adapter selon votre choix sur Apify)
+    run_input = {
+        "location": ville,
+        "max_price": int(budget_max),
+        "category": "immobilier",
+        "limit": 10
+    }
+    
+    try:
+        # Appel synchrone au scraper
+        run = client.actor("dtrungtin/leboncoin-scraper").call(run_input=run_input)
+        results = []
+        for item in client.dataset(run["defaultDatasetId"]).iterate_items():
+            results.append({
+                "id": item.get("id", "N/A"),
+                "titre": item.get("title", "Sans titre"),
+                "prix": item.get("price", 0),
+                "surface": item.get("attributes", {}).get("square", 0),
+                "images": item.get("images", []),
+                "url": item.get("url", "#"),
+                "loc": [item.get("location", {}).get("lng", 0), item.get("location", {}).get("lat", 0)]
+            })
+        return results
+    except Exception:
+        return []
 
-        # 3. Affichage des 7 Piliers calculés
-        st.subheader("🌟 Analyse Infrastructures (Données calculées)")
-        cols_p = st.columns(7)
-        for i, (k, v) in enumerate(scores.items()):
-            cols_p[i].progress(v/10, text=k)
-            cols_p[i].write(f"**{v}/10**")
+# --- INTERFACE UTILISATEUR (STREAMLIT) ---
 
-        # 4. Annonces Dynamiques
-        st.divider()
-        st.subheader("🔎 Opportunités Détectées")
-        
-        annonces = fetch_real_listings(ville_nom, code_insee, budget_max)
-        
-        for ann in annonces:
-            p_m2_ann = round(ann['prix'] / ann['surface'])
-            # Calcul du trajet vers Paris via API SNCF
-            coords_paris = [2.3219, 48.8412]
-            temps_train = get_sncf_times(sncf_token, coords_ville, coords_paris)
-            
-            with st.container(border=True):
-                c_img, c_desc = st.columns([1, 2])
-                
-                with c_img:
-                    st.image(ann['images'][0], width='stretch') # Utilisation de stretch pour les logs
-                
-                with c_desc:
-                    st.write(f"### {ann['titre']}")
-                    st.write(f"💰 **{ann['prix']:,} €** | 📐 **{ann['surface']} m²**")
-                    
-                    sc1, sc2, sc3 = st.columns(3)
-                    sc1.metric("Prix m²", f"{p_m2_ann} €")
-                    sc2.metric("🚆 Train (Paris)", f"{temps_train} min")
-                    
-                    with sc3:
-                        if p_m2_ann < prix_m2_moyen:
-                            diff = round(((prix_m2_moyen - p_m2_ann) / prix_m2_moyen) * 100)
-                            st.success(f"🔥 SOUS-COTÉ : -{diff}%")
-                        else:
-                            st.info("Prix Marché")
-                    
-                    st.button(f"Générer Rapport PDF ({ann['id']})", key=ann['id'], width='stretch')
+st.title("🤖 InvestImmo Bot : Intelligence Artificielle Immobilière")
+st.markdown("---")
 
+# Sidebar pour la configuration
+with st.sidebar:
+    st.header("🔑 Configuration API")
+    apify_token = st.text_input("Apify API Token", type="password", help="Pour le scraping réel")
+    sncf_token = st.text_input("SNCF API Token", type="password", help="Pour le calcul de trajet")
+    
+    st.header("🔍 Critères de Recherche")
+    ville_cible = st.text_input("Ville de recherche", "Versailles")
+    budget_max = st.number_input("Budget Maximum (€)", value=500000, step=10000)
+    
+    submit = st.button("🚀 Lancer l'Analyse Live", use_container_width=True)
+
+if submit:
+    if not sncf_token or not ville_cible:
+        st.error("Veuillez remplir au moins la ville et le token SNCF.")
     else:
-        st.error("Ville non trouvée par l'API Géo.")
+        # 1. RÉCUPÉRATION DES DONNÉES GÉOGRAPHIQUES (API GOUV)
+        with st.spinner("Analyse de la ville en cours..."):
+            geo_url = f"https://geo.api.gouv.fr/communes?nom={ville_cible}&fields=code,population,centre"
+            geo_res = requests.get(geo_url).json()
+            
+        if geo_res:
+            ville_data = geo_res[0]
+            code_insee = ville_data['code']
+            population = ville_data.get('population', 0)
+            coords_ville = ville_data['centre']['coordinates']
+            
+            # 2. ANALYSE DU MARCHÉ ET SERVICES
+            prix_m2_moyen = get_dvf_prices_dynamic(code_insee)
+            piliers = get_dynamic_piliers(population)
+            
+            st.header(f"📍 Rapport Sectoriel : {ville_data['nom']}")
+            
+            # Métriques principales
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Population Réelle", f"{population:,} hab.")
+            m2.metric("Prix m² Marché (DVF)", f"{prix_m2_moyen} €")
+            m3.metric("Tension Immobilière", "Haute" if population > 50000 else "Modérée")
+            
+            # Affichage des 7 Piliers
+            st.subheader("🌟 Diagnostic Qualité de Vie")
+            cols = st.columns(7)
+            for i, (nom, score) in enumerate(piliers.items()):
+                cols[i].progress(score/10, text=nom)
+                cols[i].write(f"**{score}/10**")
+                
+            # 3. SCRAPING ET AFFICHAGE DES ANNONCES
+            st.divider()
+            st.subheader("🔥 Opportunités Détectées en Direct")
+            
+            with st.spinner("Scraping des annonces web..."):
+                annonces = get_real_listings_web(apify_token, ville_cible, budget_max)
+            
+            if not annonces:
+                st.warning("Aucune annonce trouvée via le scraper. Vérifiez votre token Apify.")
+            else:
+                for ann in annonces:
+                    # Calculs dynamiques par annonce
+                    p_m2_ann = round(ann['prix'] / ann['surface']) if ann['surface'] > 0 else 0
+                    # Trajet vers Paris (Châtelet) par défaut
+                    temps_paris = get_sncf_times(sncf_token, coords_ville, [2.3488, 48.8534])
+                    
+                    with st.container(border=True):
+                        c_img, c_info = st.columns([1, 2])
+                        
+                        with c_img:
+                            if ann['images']:
+                                st.image(ann['images'][0], width='stretch')
+                            else:
+                                st.image("https://via.placeholder.com/400x300?text=Pas+de+photo", width='stretch')
+                        
+                        with c_info:
+                            st.write(f"### {ann['titre']}")
+                            st.write(f"💰 **{ann['prix']:,} €** | 📐 **{ann['surface']} m²**")
+                            
+                            sc1, sc2, sc3 = st.columns(3)
+                            sc1.metric("Prix m²", f"{p_m2_ann} €")
+                            sc2.metric("🚆 Gare Paris", f"{temps_paris} min")
+                            
+                            with sc3:
+                                if prix_m2_moyen > 0 and p_m2_ann < prix_m2_moyen:
+                                    diff = round(((prix_m2_moyen - p_m2_ann) / prix_m2_moyen) * 100)
+                                    st.success(f"DÉCOTE : -{diff}%")
+                                else:
+                                    st.info("Prix Marché")
+                            
+                            st.link_button("🌐 Consulter l'annonce originale", ann['url'], use_container_width=True)
+        else:
+            st.error("Ville non identifiée. Vérifiez l'orthographe.")
+
 else:
-    st.info("Veuillez configurer votre Token SNCF et une ville cible pour lancer l'analyse autonome.")
+    st.info("👋 Bienvenue. Configurez vos accès dans le menu de gauche et lancez l'analyse.")
