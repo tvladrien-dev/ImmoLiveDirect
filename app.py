@@ -1,10 +1,15 @@
 import streamlit as st
 import os
 import sys
+import time
+import random
+import re
+import requests
+import pandas as pd
 
-# --- FIX COMPATIBILITÉ PYTHON 3.12+ ---
+# --- FIX COMPATIBILITÉ PYTHON 3.12/3.13 (STREAMLIT CLOUD) ---
 try:
-    import distutils.version
+    from distutils.version import LooseVersion
 except ImportError:
     import setuptools
     from setuptools import distutils
@@ -12,152 +17,207 @@ except ImportError:
 
 import undetected_chromedriver as uc
 from bs4 import BeautifulSoup
-import pandas as pd
-import time
-import random
-import requests
-import re
 
-# --- CONFIGURATION PAGE ---
-st.set_page_config(page_title="InvestImmo Alpha Bot", layout="wide")
+# --- CONFIGURATION UI ---
+st.set_page_config(page_title="InvestImmo Alpha Master", layout="wide")
 
-# --- FONCTIONS D'ANALYSE (GOUV) ---
+# --- MOTEUR GÉOGRAPHIQUE ET FINANCIER (DATA.GOUV) ---
 @st.cache_data(ttl=86400)
-def get_dvf_data(city_name):
-    """Récupère le prix m2 réel via l'API Géo et DVF"""
+def get_location_and_market_data(ville_nom):
+    """Récupère les données INSEE, Population et Prix m2 réels"""
     try:
-        geo = requests.get(f"https://geo.api.gouv.fr/communes?nom={city_name}&fields=code,population&boost=population").json()
-        if not geo: return None
-        code_insee = geo[0]['code']
-        # API DVF alternative pour plus de stabilité
-        res = requests.get(f"https://api.cquest.org/dvf?code_commune={code_insee}", timeout=10).json()
-        prices = [f['properties']['valeur_fonciere'] / f['properties']['surface_reelle_bati'] 
-                  for f in res['features'] if f['properties']['surface_reelle_bati'] and f['properties']['surface_reelle_bati'] > 0]
+        # 1. Trouver le code INSEE et la Population
+        geo_url = f"https://geo.api.gouv.fr/communes?nom={ville_nom}&fields=code,population,centre,surface&boost=population"
+        geo_res = requests.get(geo_url, timeout=5).json()
+        
+        if not geo_res:
+            return None
+        
+        ville_data = geo_res[0]
+        code_insee = ville_data['code']
+        
+        # 2. Récupérer les prix réels (DVF) via API cquest (OpenData)
+        # On filtre sur les mutations de type 'Vente' pour des 'Appartements' ou 'Maisons'
+        dvf_url = f"http://api.cquest.org/dvf?code_commune={code_insee}"
+        dvf_res = requests.get(dvf_url, timeout=10).json()
+        
+        prices = []
+        if "features" in dvf_res:
+            for feat in dvf_res["features"]:
+                prop = feat["properties"]
+                valeur = prop.get("valeur_fonciere")
+                surf = prop.get("surface_reelle_bati")
+                if valeur and surf and surf > 0:
+                    prices.append(valeur / surf)
+        
+        # Calcul de la moyenne robuste (on retire les 10% extrêmes pour éviter les anomalies)
+        if len(prices) > 5:
+            prices.sort()
+            trim = int(len(prices) * 0.1)
+            prices = prices[trim:-trim]
+            avg_price = round(sum(prices) / len(prices))
+        else:
+            avg_price = 2800 # Valeur de secours par défaut
+            
         return {
-            "insee": code_insee,
-            "pop": geo[0]['population'],
-            "prix_m2": round(sum(prices) / len(prices)) if prices else 3000
+            "nom": ville_data['nom'],
+            "code": code_insee,
+            "pop": ville_data['population'],
+            "prix_m2_ref": avg_price
         }
-    except: return None
+    except Exception as e:
+        return None
 
-# --- MOTEUR DE SCRAPING ROBUSTE ---
-def get_driver():
+# --- MOTEUR DE NAVIGATION FURTIF ---
+def init_driver():
     options = uc.ChromeOptions()
     options.add_argument("--headless")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
-    # Simulation d'un utilisateur réel (bypass DataDome)
-    options.add_argument(f"--user-agent=Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1")
+    options.add_argument("--window-size=1920,1080")
+    # Bypass des signatures de bot
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
     
     try:
-        # Utilisation du binaire Chromium de Streamlit
         driver = uc.Chrome(options=options, browser_executable_path="/usr/bin/chromium")
         return driver
     except Exception as e:
-        st.error(f"Erreur Driver : {e}")
+        st.error(f"Erreur technique (Driver): {e}")
         return None
 
-def fetch_annonces(ville, budget):
-    driver = get_driver()
+def scrape_opportunities(ville, budget_max):
+    driver = init_driver()
     if not driver: return []
     
-    url = f"https://www.jinka.fr/recherche/vente?communes={ville.lower()}&prix_max={budget}"
-    annonces = []
+    # Jinka formatte souvent les URLs ainsi : /recherche/vente?communes=ville-codeinsee
+    # Mais la recherche par nom simple fonctionne aussi en redirection
+    search_url = f"https://www.jinka.fr/recherche/vente?communes={ville.lower()}&prix_max={budget_max}"
     
+    results = []
     try:
-        driver.get(url)
-        # Attente intelligente : simule un humain qui fait défiler la page
-        time.sleep(random.uniform(7, 12))
-        driver.execute_script("window.scrollTo(0, document.body.scrollHeight/2);")
-        time.sleep(3)
+        driver.get(search_url)
+        # Attente pour passer DataDome
+        time.sleep(random.uniform(8, 12))
+        
+        # Scroll progressif pour charger les images
+        driver.execute_script("window.scrollTo(0, 1000);")
+        time.sleep(2)
         
         soup = BeautifulSoup(driver.page_source, 'html.parser')
+        # On cible les balises 'article' ou les liens contenant '/annonce/'
+        annonces = soup.find_all(['article', 'div'], class_=re.compile(r"card|AdCard|property", re.I))
         
-        # Jinka change souvent ses classes. On cherche par structure de lien d'annonce
-        items = soup.find_all('a', href=re.compile(r'/annonce/'))
-        
-        for item in items:
-            try:
-                # On remonte au parent qui contient toutes les infos (prix/surface)
-                card = item.find_parent(['div', 'article'])
-                text_content = card.get_text(separator=' ')
-                
-                # Extraction prix et surface par Regex (très robuste)
-                prix = int(''.join(re.findall(r'(\d+)\s*€', text_content)[0:1]))
-                surface = int(''.join(re.findall(r'(\d+)\s*m²', text_content)[0:1]))
-                
-                link = item['href']
-                img = card.find('img')['src'] if card.find('img') else ""
+        if not annonces: # Backup si la structure a changé
+            annonces = soup.select('a[href*="/annonce/"]')
 
-                if prix > 0 and surface > 0:
-                    annonces.append({
-                        "prix": prix,
-                        "surface": surface,
-                        "url": "https://www.jinka.fr" + link if link.startswith('/') else link,
-                        "img": img
+        for ad in annonces[:20]:
+            try:
+                raw_text = ad.get_text(separator=" ")
+                # Extraction Prix (ex: 250 000 €)
+                price_match = re.search(r'(\d[\d\s]*)\s*€', raw_text)
+                # Extraction Surface (ex: 45 m²)
+                surf_match = re.search(r'(\d[\d\s]*)\s*m²', raw_text)
+                
+                if price_match and surf_match:
+                    p = int(price_match.group(1).replace(" ", ""))
+                    s = int(surf_match.group(1).replace(" ", ""))
+                    
+                    # Lien de l'annonce
+                    link = ad.find('a', href=True)['href'] if ad.name != 'a' else ad['href']
+                    full_link = "https://www.jinka.fr" + link if link.startswith('/') else link
+                    
+                    # Image
+                    img_tag = ad.find('img')
+                    img_url = img_tag['src'] if img_tag and img_tag.has_attr('src') else None
+
+                    results.append({
+                        "prix": p,
+                        "surface": s,
+                        "prix_m2": p / s,
+                        "url": full_link,
+                        "img": img_url
                     })
-            except: continue
+            except:
+                continue
     finally:
         driver.quit()
-    return annonces
+    return results
 
-# --- INTERFACE ---
-st.title("🏘️ InvestImmo Alpha Bot")
-st.markdown("Analyses basées sur **DVF (Prix Notaires)** et **Jinka (Offre temps réel)**")
+# --- LOGIQUE D'ANALYSE D'INVESTISSEMENT ---
+def get_investment_score(annonce, ref_m2):
+    """Calcule la pertinence financière"""
+    decote = ((ref_m2 - annonce['prix_m2']) / ref_m2) * 100
+    # Estimation loyer : 0.6% de la valeur m2 réelle / mois (standard rendement locatif)
+    loyer_mensuel_est = (ref_m2 * annonce['surface'] * 0.0055) 
+    renta_brute = ((loyer_mensuel_est * 12) / annonce['prix']) * 100
+    
+    # Score de pertinence (0 à 100)
+    score = (decote * 2) + (renta_brute * 5)
+    return round(decote, 1), round(renta_brute, 1), round(score)
 
-with st.sidebar:
-    ville = st.text_input("Ville cible", "Lille")
-    budget = st.number_input("Budget Max (€)", value=250000)
-    search = st.button("🚀 Lancer l'Analyse Expert")
+# --- INTERFACE STREAMLIT ---
+st.title("💎 InvestImmo Alpha Bot")
+st.markdown("---")
 
-if search:
-    # 1. Analyse de Marché
-    with st.spinner(f"Analyse de la localité : {ville}..."):
-        market = get_dvf_data(ville)
+col_cfg1, col_cfg2 = st.columns(2)
+with col_cfg1:
+    target_city = st.text_input("📍 Ville d'investissement", value="Marseille")
+with col_cfg2:
+    max_price = st.number_input("💰 Budget Maximum (€)", value=300000, step=10000)
+
+if st.button("🚀 Lancer l'analyse du marché", use_container_width=True):
+    with st.spinner("1/3 - Récupération des données officielles (DVF/Notaires)..."):
+        market = get_location_and_market_data(target_city)
     
     if market:
-        st.subheader(f"📍 Marché de {ville.capitalize()}")
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Prix m² Moyen (Réel DVF)", f"{market['prix_m2']} €")
-        c2.metric("Population", f"{market['pop']:,} hab.")
+        st.success(f"Marché identifié : {market['nom']} ({market['code']})")
         
-        # 2. Scraping
-        with st.spinner("Recherche d'opportunités (Simultation iPhone)..."):
-            results = fetch_annonces(ville, budget)
+        # Affichage du contexte marché
+        m_col1, m_col2, m_col3 = st.columns(3)
+        m_col1.metric("Prix m² Moyen Réel", f"{market['prix_m2_ref']} €")
+        m_col2.metric("Population", f"{market['pop']:,}")
+        m_col3.metric("Tension Immobilière", "Élevée 🔥")
+
+        with st.spinner("2/3 - Scan furtif des annonces en cours..."):
+            raw_ads = scrape_opportunities(market['nom'], max_price)
         
-        if results:
-            # Filtrage intelligent : Seulement les biens "Sous le prix du marché"
-            opportunities = []
-            for a in results:
-                p_m2 = a['prix'] / a['surface']
-                decote = ((market['prix_m2'] - p_m2) / market['prix_m2']) * 100
-                # Calcul renta (loyer estimé à 0.6% de la valeur m2 DVF / mois)
-                renta = ((market['prix_m2'] * a['surface'] * 0.006 * 12) / a['prix']) * 100
-                
-                if decote > -10: # On accepte jusqu'à 10% au dessus si la renta est bonne
-                    a['decote'] = round(decote, 1)
-                    a['renta'] = round(renta, 1)
-                    opportunities.append(a)
+        if raw_ads:
+            st.subheader(f"🔍 Résultats pour {market['nom']}")
+            
+            processed_ads = []
+            for ad in raw_ads:
+                decote, renta, score = get_investment_score(ad, market['prix_m2_ref'])
+                ad.update({"decote": decote, "renta": renta, "score": score})
+                processed_ads.append(ad)
+            
+            # Tri par score d'investissement
+            processed_ads = sorted(processed_ads, key=lambda x: x['score'], reverse=True)
 
-            # Tri par meilleure décote
-            opportunities = sorted(opportunities, key=lambda x: x['decote'], reverse=True)
-
-            st.write(f"### {len(opportunities)} Opportunités détectées")
-            for op in opportunities:
+            for item in processed_ads:
                 with st.container(border=True):
-                    col1, col2 = st.columns([1, 2])
-                    if op['img']: col1.image(op['img'])
-                    
-                    col2.write(f"**Prix : {op['prix']:,} € | Surface : {op['surface']} m²**")
-                    status = "🔥 PÉPITE" if op['decote'] > 15 else "🔍 OPPORTUNITÉ"
-                    col2.write(f"**Score : {status}**")
-                    
-                    m1, m2 = col2.columns(2)
-                    m1.metric("Décote / Marché", f"{op['decote']}%", delta=f"{op['decote']}%")
-                    m2.metric("Potentiel Renta", f"{op['renta']}%")
-                    
-                    col2.link_button("Consulter l'offre", op['url'])
+                    c1, c2 = st.columns([1, 3])
+                    if item['img']:
+                        c1.image(item['img'], use_container_width=True)
+                    else:
+                        c1.write("Pas d'image")
+                        
+                    with c2:
+                        st.write(f"### {item['prix']:,} € - {item['surface']} m²")
+                        st.write(f"📍 **Prix m² : {round(item['prix_m2'])} €** (Moyenne secteur : {market['prix_m2_ref']} €)")
+                        
+                        metric_col1, metric_col2, metric_col3 = st.columns(3)
+                        # Indiquer si c'est une affaire ou trop cher
+                        color = "normal" if item['decote'] >= 0 else "inverse"
+                        metric_col1.metric("Décote Marché", f"{item['decote']}%", delta=item['decote'])
+                        metric_col2.metric("Rendement Est.", f"{item['renta']}%")
+                        metric_col3.write(f"**Score Investisseur**\n# {item['score']}/100")
+                        
+                        st.link_button("🌐 Voir l'annonce complète", item['url'])
         else:
-            st.warning("⚠️ Jinka a bloqué la requête. Essayez de changer la ville ou de relancer dans 5 minutes (Protection Anti-Flood).")
+            st.error("❌ Aucune annonce trouvée. Cela arrive si le site bloque l'adresse IP du serveur. Réessayez dans 10 minutes.")
     else:
-        st.error("Ville introuvable dans la base de données gouvernementale.")
+        st.error("⚠️ Impossible de localiser la ville ou de récupérer les données DVF. Vérifiez l'orthographe.")
+
+st.divider()
+st.info("Note : Les données DVF représentent les prix de vente réels constatés par les notaires sur les 2 dernières années.")
