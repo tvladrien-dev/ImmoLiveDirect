@@ -1,122 +1,163 @@
 import streamlit as st
-import requests
-import pandas as pd
-import undetected_chromedriver as uc
-from bs4 import BeautifulSoup
-import re
-import time
-
-# --- CONFIGURATION ET FIX COMPATIBILITÉ ---
+import os
 import sys
+
+# --- FIX COMPATIBILITÉ PYTHON 3.12+ ---
 try:
+    import distutils.version
+except ImportError:
+    import setuptools
     from setuptools import distutils
     sys.modules['distutils'] = distutils
-except:
-    pass
 
-st.set_page_config(page_title="Real Estate Alpha Bot", layout="wide")
+import undetected_chromedriver as uc
+from bs4 import BeautifulSoup
+import pandas as pd
+import time
+import random
+import requests
+import re
 
-# --- 1. MOTEUR D'ANALYSE DE LA VILLE (ATTRACTIVITÉ) ---
-@st.cache_data
-def get_city_metrics(ville_nom):
-    """Récupère les données d'attractivité via API Geo Gouv"""
-    url = f"https://geo.api.gouv.fr/communes?nom={ville_nom}&fields=code,population,codesPostaux&boost=population"
-    res = requests.get(url).json()
-    if res:
-        data = res[0]
-        # Simulation d'un score d'attractivité basé sur la population et la tension
-        score = min(100, (data['population'] / 10000) * 1.5) 
-        return data['code'], data['population'], round(score, 1)
-    return None, None, None
+# --- CONFIGURATION PAGE ---
+st.set_page_config(page_title="InvestImmo Alpha Bot", layout="wide")
 
-# --- 2. ESTIMATION PRIX DU MARCHÉ (DVF) ---
-@st.cache_data
-def get_market_price(code_insee):
-    """Récupère le prix moyen réel m2 (Données Notaires)"""
-    # Utilisation de l'API cquest qui indexe les DVF
-    url = f"http://api.cquest.org/dvf?code_commune={code_insee}"
+# --- FONCTIONS D'ANALYSE (GOUV) ---
+@st.cache_data(ttl=86400)
+def get_dvf_data(city_name):
+    """Récupère le prix m2 réel via l'API Géo et DVF"""
     try:
-        data = requests.get(url, timeout=10).json()
+        geo = requests.get(f"https://geo.api.gouv.fr/communes?nom={city_name}&fields=code,population&boost=population").json()
+        if not geo: return None
+        code_insee = geo[0]['code']
+        # API DVF alternative pour plus de stabilité
+        res = requests.get(f"https://api.cquest.org/dvf?code_commune={code_insee}", timeout=10).json()
         prices = [f['properties']['valeur_fonciere'] / f['properties']['surface_reelle_bati'] 
-                  for f in data['features'] if f['properties']['surface_reelle_bati'] > 0]
-        return round(sum(prices) / len(prices)) if prices else 0
-    except:
-        return 2500 # Prix par défaut si erreur API
+                  for f in res['features'] if f['properties']['surface_reelle_bati'] and f['properties']['surface_reelle_bati'] > 0]
+        return {
+            "insee": code_insee,
+            "pop": geo[0]['population'],
+            "prix_m2": round(sum(prices) / len(prices)) if prices else 3000
+        }
+    except: return None
 
-# --- 3. SCRAPER FURTIF (JINKA) ---
-def scrape_jinka(ville, budget_max):
+# --- MOTEUR DE SCRAPING ROBUSTE ---
+def get_driver():
     options = uc.ChromeOptions()
     options.add_argument("--headless")
-    driver = uc.Chrome(options=options, browser_executable_path="/usr/bin/chromium")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    # Simulation d'un utilisateur réel (bypass DataDome)
+    options.add_argument(f"--user-agent=Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1")
     
-    results = []
-    url = f"https://www.jinka.fr/recherche/vente?communes={ville.lower()}&prix_max={budget_max}"
+    try:
+        # Utilisation du binaire Chromium de Streamlit
+        driver = uc.Chrome(options=options, browser_executable_path="/usr/bin/chromium")
+        return driver
+    except Exception as e:
+        st.error(f"Erreur Driver : {e}")
+        return None
+
+def fetch_annonces(ville, budget):
+    driver = get_driver()
+    if not driver: return []
+    
+    url = f"https://www.jinka.fr/recherche/vente?communes={ville.lower()}&prix_max={budget}"
+    annonces = []
     
     try:
         driver.get(url)
-        time.sleep(10) # Temps pour bypasser les protections
+        # Attente intelligente : simule un humain qui fait défiler la page
+        time.sleep(random.uniform(7, 12))
+        driver.execute_script("window.scrollTo(0, document.body.scrollHeight/2);")
+        time.sleep(3)
+        
         soup = BeautifulSoup(driver.page_source, 'html.parser')
         
-        # Logique de capture simplifiée pour l'exemple
-        for card in soup.select('article')[:10]:
+        # Jinka change souvent ses classes. On cherche par structure de lien d'annonce
+        items = soup.find_all('a', href=re.compile(r'/annonce/'))
+        
+        for item in items:
             try:
-                p_text = card.find(text=re.compile(r"€")).replace(" ", "")
-                prix = int(re.search(r'\d+', p_text).group())
-                s_text = card.find(text=re.compile(r"m²")).replace(" ", "")
-                surface = int(re.search(r'\d+', s_text).group())
-                link = card.find('a')['href']
+                # On remonte au parent qui contient toutes les infos (prix/surface)
+                card = item.find_parent(['div', 'article'])
+                text_content = card.get_text(separator=' ')
                 
-                results.append({"prix": prix, "surface": surface, "url": link})
+                # Extraction prix et surface par Regex (très robuste)
+                prix = int(''.join(re.findall(r'(\d+)\s*€', text_content)[0:1]))
+                surface = int(''.join(re.findall(r'(\d+)\s*m²', text_content)[0:1]))
+                
+                link = item['href']
+                img = card.find('img')['src'] if card.find('img') else ""
+
+                if prix > 0 and surface > 0:
+                    annonces.append({
+                        "prix": prix,
+                        "surface": surface,
+                        "url": "https://www.jinka.fr" + link if link.startswith('/') else link,
+                        "img": img
+                    })
             except: continue
     finally:
         driver.quit()
-    return results
+    return annonces
 
-# --- 4. INTERFACE ET LOGIQUE D'INVESTISSEMENT ---
-st.title("🚀 Real Estate Alpha Bot")
-st.sidebar.header("Paramètres d'Investissement")
+# --- INTERFACE ---
+st.title("🏘️ InvestImmo Alpha Bot")
+st.markdown("Analyses basées sur **DVF (Prix Notaires)** et **Jinka (Offre temps réel)**")
 
-target_city = st.sidebar.text_input("Ville cible", "Marseille")
-budget = st.sidebar.number_input("Budget Max (€)", value=200000)
+with st.sidebar:
+    ville = st.text_input("Ville cible", "Lille")
+    budget = st.number_input("Budget Max (€)", value=250000)
+    search = st.button("🚀 Lancer l'Analyse Expert")
 
-if st.sidebar.button("Analyser les Opportunités"):
-    code_insee, pop, attract_score = get_city_metrics(target_city)
+if search:
+    # 1. Analyse de Marché
+    with st.spinner(f"Analyse de la localité : {ville}..."):
+        market = get_dvf_data(ville)
     
-    if code_insee:
-        price_m2_ref = get_market_price(code_insee)
+    if market:
+        st.subheader(f"📍 Marché de {ville.capitalize()}")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Prix m² Moyen (Réel DVF)", f"{market['prix_m2']} €")
+        c2.metric("Population", f"{market['pop']:,} hab.")
         
-        # Affichage metrics ville
-        st.subheader(f"📊 Analyse de {target_city.capitalize()}")
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Prix Marché (m²)", f"{price_m2_ref} €")
-        col2.metric("Score Attractivité", f"{attract_score}/100")
-        col3.metric("Population", f"{pop:,}")
-
-        # Lancement du Bot
-        with st.spinner("Recherche d'opportunités sous le prix du marché..."):
-            deals = scrape_jinka(target_city, budget)
+        # 2. Scraping
+        with st.spinner("Recherche d'opportunités (Simultation iPhone)..."):
+            results = fetch_annonces(ville, budget)
         
-        if deals:
-            st.success(f"{len(deals)} annonces trouvées. Analyse financière en cours...")
-            
-            for d in deals:
-                p_m2_annonce = d['prix'] / d['surface']
-                # Calcul de l'opportunité (Décote)
-                decote = ((price_m2_ref - p_m2_annonce) / price_m2_ref) * 100
+        if results:
+            # Filtrage intelligent : Seulement les biens "Sous le prix du marché"
+            opportunities = []
+            for a in results:
+                p_m2 = a['prix'] / a['surface']
+                decote = ((market['prix_m2'] - p_m2) / market['prix_m2']) * 100
+                # Calcul renta (loyer estimé à 0.6% de la valeur m2 DVF / mois)
+                renta = ((market['prix_m2'] * a['surface'] * 0.006 * 12) / a['prix']) * 100
                 
-                # Estimation Potentiel Locatif (Renta Brute théorique)
-                # Basé sur un loyer moyen estimé à 0.5% de la valeur vénale/mois
-                loyer_est = (price_m2_ref * d['surface'] * 0.006) 
-                renta = ((loyer_est * 12) / d['prix']) * 100
+                if decote > -10: # On accepte jusqu'à 10% au dessus si la renta est bonne
+                    a['decote'] = round(decote, 1)
+                    a['renta'] = round(renta, 1)
+                    opportunities.append(a)
 
-                # Affichage conditionnel : Uniquement les vraies opportunités
-                if decote > 5 or renta > 7:
-                    with st.expander(f"💎 OPPORTUNITÉ : {d['prix']:,} € - {d['surface']} m²"):
-                        c1, c2 = st.columns(2)
-                        status = "🔥 EXCELLENT" if decote > 15 else "✅ BON"
-                        c1.write(f"**Prix m² :** {round(p_m2_annonce)} € (Réf: {price_m2_ref} €)")
-                        c1.write(f"**Décote :** {round(decote, 1)}% ({status})")
-                        c2.write(f"**Renta. Estimée :** {round(renta, 1)}% brute")
-                        st.link_button("Ouvrir l'annonce", f"https://www.jinka.fr{d['url']}")
+            # Tri par meilleure décote
+            opportunities = sorted(opportunities, key=lambda x: x['decote'], reverse=True)
+
+            st.write(f"### {len(opportunities)} Opportunités détectées")
+            for op in opportunities:
+                with st.container(border=True):
+                    col1, col2 = st.columns([1, 2])
+                    if op['img']: col1.image(op['img'])
+                    
+                    col2.write(f"**Prix : {op['prix']:,} € | Surface : {op['surface']} m²**")
+                    status = "🔥 PÉPITE" if op['decote'] > 15 else "🔍 OPPORTUNITÉ"
+                    col2.write(f"**Score : {status}**")
+                    
+                    m1, m2 = col2.columns(2)
+                    m1.metric("Décote / Marché", f"{op['decote']}%", delta=f"{op['decote']}%")
+                    m2.metric("Potentiel Renta", f"{op['renta']}%")
+                    
+                    col2.link_button("Consulter l'offre", op['url'])
         else:
-            st.warning("Aucune annonce ne correspond aux critères ou le bot a été bloqué.")
+            st.warning("⚠️ Jinka a bloqué la requête. Essayez de changer la ville ou de relancer dans 5 minutes (Protection Anti-Flood).")
+    else:
+        st.error("Ville introuvable dans la base de données gouvernementale.")
